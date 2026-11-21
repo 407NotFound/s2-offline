@@ -1,0 +1,73 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "原版 2.07 IPA 的直链（R2/S3 presigned 或 release asset）"
+        required: true
+
+jobs:
+  ipa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deps
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ldid unzip zip curl python3 || {
+            git clone --depth=1 https://github.com/ProcursusTeam/ldid /tmp/ldid
+            make -C /tmp/ldid -j4 && sudo cp /tmp/ldid/ldid /usr/local/bin/
+          }
+
+      - name: Fetch IPA
+        run: |
+          set -eux
+          mkdir -p work && cd work
+          curl -L --retry 3 --retry-delay 5 -o orig.ipa "${{ inputs.ipa_url }}"
+          ls -lh orig.ipa
+          python3 -c "import hashlib;print('sha256',hashlib.sha256(open('orig.ipa','rb').read()).hexdigest())"
+
+      - name: Unpack
+        run: |
+          set -eux
+          cd work
+          unzip -q orig.ipa -d app
+          APP=app/Payload/StandChillow.app
+          test -d "$APP"
+          # 提取原有 entitlements，重签时必须带回去
+          ldid -e "$APP/StandChillow" > ent.plist 2>/dev/null || echo "<plist/>" > ent.plist
+          head -c 300 ent.plist || true
+
+      - name: Inject dylib
+        run: |
+          set -eux
+          cd work
+          APP=app/Payload/StandChillow.app
+          cp ../dist/OfflineOnly.dylib "$APP/Frameworks/"
+          chmod 755 "$APP/Frameworks/OfflineOnly.dylib"
+          python3 ../tools/macho_inject.py "$APP/StandChillow" "@executable_path/Frameworks/OfflineOnly.dylib"
+          ldid -S "$APP/Frameworks/OfflineOnly.dylib"
+          ldid -S ent.plist "$APP/StandChillow"
+          echo "signed main binary"
+
+      - name: Repack
+        run: |
+          set -eux
+          cd work
+          zip -qry -1 ../Standoff2-Offline-unsigned.ipa Payload
+          cd ..
+          ls -lh Standoff2-Offline-unsigned.ipa
+          python3 -c "import hashlib;h=hashlib.sha256(open('Standoff2-Offline-unsigned.ipa','rb').read()).hexdigest();open('sha256.txt','w').write(h+'  Standoff2-Offline-unsigned.ipa\n');print(h)"
+          split -b 1800m Standoff2-Offline-unsigned.ipa part_
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-ipa-parts
+          path: |
+            part_*
+            sha256.txt
+          compression-level: 0
