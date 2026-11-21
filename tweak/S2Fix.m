@@ -21,10 +21,12 @@
 
 static NSString *g_logPath;
 
-static void s2log(NSString *fmt, ...) {
+static void s2log(const char *fmt, ...) {
+    char buf[1024];
     va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    NSString *msg = [NSString stringWithUTF8String:buf];
     NSLog(@"[S2Fix] %@", msg);
     if (!g_logPath) return;
     static NSDateFormatter *df; static dispatch_once_t once;
@@ -80,6 +82,13 @@ static NSString *il2s(void *s) {   // Il2CppString: [klass][monitor][len:i32][ut
     return [[NSString alloc] initWithCharacters:p length:n];
 }
 
+static const char *ilsc(void *s) {
+    static __thread char buf[512];
+    NSString *x = il2s(s);
+    snprintf(buf, sizeof buf, "%s", x ? [x UTF8String] : "(null)");
+    return buf;
+}
+
 static void patch_pointer(void *methodInfo, void *replacement) {
     void **slot = (void **)methodInfo;
     uintptr_t page = (uintptr_t)slot & ~(uintptr_t)0xFFF;
@@ -102,9 +111,9 @@ static void r_setFieldOfView(void *cam, float v, void *m) { S2LOG("Camera.fieldO
 static void r_setAspect(void *cam, float v, void *m) { S2LOG("Camera.aspect <- %.4f", v); }
 static void r_setResolution(void *a, void *b, void *c, void *m) { S2LOG("Screen.SetResolution(...)"); }
 
-static void r_prefsSetFloat(void *k, float v, void *m) { S2LOG("PlayerPrefs.SetFloat(%@) = %.3f", il2s(k), v); }
-static void r_prefsSetInt(void *k, int v, void *m) { S2LOG("PlayerPrefs.SetInt(%@) = %d", il2s(k), v); }
-static void r_prefsSetString(void *k, void *v, void *m) { S2LOG("PlayerPrefs.SetString(%@) = %@", il2s(k), il2s(v)); }
+static void r_prefsSetFloat(void *k, float v, void *m) { S2LOG("PlayerPrefs.SetFloat(%s) = %.3f", ilsc(k), v); }
+static void r_prefsSetInt(void *k, int v, void *m) { S2LOG("PlayerPrefs.SetInt(%s) = %d", ilsc(k), v); }
+static void r_prefsSetString(void *k, void *v, void *m) { S2LOG("PlayerPrefs.SetString(%s) = %s", ilsc(k), ilsc(v)); }
 
 #pragma mark - 扫描挂钩
 
@@ -170,7 +179,7 @@ static void *hook_named(const char *ns, const char *cls, const char *name, int a
 
 static void install(void) {
     S2LOG("=== install v2 ===");
-    S2LOG("device=%@ sys=%@", [[UIDevice currentDevice] model], [[UIDevice currentDevice] systemVersion]);
+    S2LOG("device=%s sys=%s", [[[UIDevice currentDevice] model] UTF8String], [[[UIDevice currentDevice] systemVersion] UTF8String]);
     scan_all();
 
     const char *unity = "UnityEngine.CoreModule";
@@ -210,6 +219,6 @@ static void s2fix_init(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     g_logPath = [docs stringByAppendingPathComponent:@"s2fix.log"];
     [[NSFileManager defaultManager] createFileAtPath:g_logPath contents:[NSData data] attributes:nil];
-    S2LOG("loaded pid=%d uid=%d log=%@", getpid(), getuid(), g_logPath);
+    S2LOG("loaded pid=%d uid=%d log=%s", getpid(), getuid(), [g_logPath UTF8String]);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ bootstrap(); });
 }
