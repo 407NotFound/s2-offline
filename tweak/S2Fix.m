@@ -1,14 +1,15 @@
-// S2Fix v2 — Standoff 2 (Unity 2022.3 / IL2CPP) iPhone 15 Pro 修复 + 诊断
+// S2Fix v3 — Standoff 2 iOS 修复补丁（离线账号可用，不依赖游戏内「应用」按钮）
 //
-// v1 已解决：120Hz（Info.plist CADisableMinimumFrameDuration + 强制 targetFrameRate）
-// v2 目标：
-//   1) 陀螺仪：不靠猜类名，全程序集扫描方法名后挂钩
-//        IsGyroAvailable / get_supportsGyroscope / SupportsGyroscope / get_gyro
-//      并把 GetDeviceModel 打出来（判定游戏是否走机型白名单）
-//   2) 纵横比 / 视野 / 手视野 / 黑色天空「应用不了」：
-//      挂 PlayerPrefs 的 Set*/Get* + Camera.set_fieldOfView + Screen.SetResolution + Camera.set_aspect
-//      全量写日志，看「应用」那一刻到底写了什么、有没有写到。
-//   3) 日志落 Documents/s2fix.log，配合 Info.plist 的 UIFileSharingEnabled 可在「文件」App 里直接取。
+// 设计前提（v2 实测反馈）：离线 localbolt 账号下，游戏内「视 → 其他」点应用会一直转圈，
+// 说明那条 apply 链路在等一个不存在的服务器；陀螺仪也显示「此设备上不可用」。
+// 所以 v3 不再指望 UI，直接在引擎层改值：
+//   * 视野 / 手视野  → 拦截 Camera.set_fieldOfView，乘系数
+//   * 纵横比        → 拦截 Camera.set_aspect，强制目标值
+//   * 帧率          → 拦截 Application.set_targetFrameRate，强制 120
+//   * 陀螺仪        → 全程序集按名挂钩 IsGyroAvailable / supportsGyroscope
+// 配置放在 Documents/s2fix.txt，改完重启游戏生效，不用重新打包。
+//
+// 启动时弹一次窗（每次装包弹一次），用来确认 dylib 到底有没有被加载。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -42,16 +43,61 @@ static void s2log(const char *fmt, ...) {
     }
 }
 
-#pragma mark - il2cpp
+#pragma mark - 配置
+
+static float g_fovMult      = 1.00f;   // 视野系数（世界）
+static float g_handsMult    = 1.00f;   // 手部视野系数
+static float g_aspect       = 0.0f;    // 0 = 不干预；1.25 = 5:4；1.3333 = 4:3；1.6 = 16:10
+static int   g_fps          = 120;
+static int   g_gyro         = 1;
+
+static NSString *g_cfgPath;
+static NSString *g_docs;
+
+static void load_config(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:g_cfgPath]) {
+        NSString *def = @"# S2Fix 配置，改完重启游戏生效\n"
+                        @"# fov: 视野系数, 1.00 = 原样, 1.10 = 放大 10%\n"
+                        @"fov=1.00\n"
+                        @"# hands_fov: 手部视野系数\n"
+                        @"hands_fov=1.00\n"
+                        @"# aspect: 0=不干预, 1.25=5:4, 1.3333=4:3, 1.6=16:10\n"
+                        @"aspect=0\n"
+                        @"# fps: 目标帧率\n"
+                        @"fps=120\n"
+                        @"# gyro: 1=强制可用\n"
+                        @"gyro=1\n";
+        [def writeToFile:g_cfgPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    }
+    NSString *txt = [NSString stringWithContentsOfFile:g_cfgPath encoding:NSUTF8StringEncoding error:NULL];
+    for (NSString *raw in [txt componentsSeparatedByString:@"\n"]) {
+        NSString *ln = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (ln.length == 0 || [ln hasPrefix:@"#"]) continue;
+        NSArray *kv = [ln componentsSeparatedByString:@"="];
+        if (kv.count < 2) continue;
+        NSString *k = [kv[0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        NSString *v = [kv[1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if ([k isEqualToString:@"fov"])            g_fovMult   = v.floatValue;
+        else if ([k isEqualToString:@"hands_fov"]) g_handsMult = v.floatValue;
+        else if ([k isEqualToString:@"aspect"])    g_aspect    = v.floatValue;
+        else if ([k isEqualToString:@"fps"])       g_fps       = v.intValue;
+        else if ([k isEqualToString:@"gyro"])      g_gyro      = v.intValue;
+    }
+    S2LOG("config fov=%.3f hands=%.3f aspect=%.4f fps=%d gyro=%d",
+          g_fovMult, g_handsMult, g_aspect, g_fps, g_gyro);
+}
+
+#pragma mark - il2cpp 符号
 
 static void *(*fn_domain_get)(void);
 static void *(*fn_domain_get_assemblies)(void *, size_t *);
 static void *(*fn_assembly_get_image)(void *);
-static void *(*fn_image_get_class_count)(void *);
+static size_t (*fn_image_get_class_count)(void *);
 static void *(*fn_image_get_class)(void *, size_t);
 static void *(*fn_class_get_methods)(void *, void **);
-static void *(*fn_class_get_name)(void *);
-static void *(*fn_class_get_namespace)(void *);
+static const char *(*fn_class_get_name)(void *);
+static const char *(*fn_class_get_namespace)(void *);
 static const char *(*fn_method_get_name)(void *);
 static int32_t (*fn_method_get_param_count)(void *);
 static void *(*fn_domain_assembly_open)(void *, const char *);
@@ -74,18 +120,15 @@ static void resolve_il2cpp(void) {
 #undef SYM
 }
 
-static NSString *il2s(void *s) {   // Il2CppString: [klass][monitor][len:i32][utf16 chars]
-    if (!s) return @"(null)";
+static NSString *il2s(void *s) {
+    if (!s) return @"";
     int32_t n = *(int32_t *)((char *)s + 16);
     if (n < 0 || n > 4096) n = 0;
-    const unichar *p = (const unichar *)((char *)s + 20);
-    return [[NSString alloc] initWithCharacters:p length:n];
+    return [[NSString alloc] initWithCharacters:(const unichar *)((char *)s + 20) length:n];
 }
-
 static const char *ilsc(void *s) {
     static __thread char buf[512];
-    NSString *x = il2s(s);
-    snprintf(buf, sizeof buf, "%s", x ? [x UTF8String] : "(null)");
+    snprintf(buf, sizeof buf, "%s", [il2s(s) UTF8String]);
     return buf;
 }
 
@@ -96,71 +139,85 @@ static void patch_pointer(void *methodInfo, void *replacement) {
     *slot = replacement;
 }
 
-#pragma mark - 替换函数（v1 已有行为保留）
+#pragma mark - 替换函数
 
-static BOOL r_supportsGyroscope(void *m) { return YES; }
-static BOOL r_isGyroAvailable(void *m) { return YES; }
+static BOOL r_supportsGyroscope(void *m) { return g_gyro ? YES : NO; }
+static BOOL r_isGyroAvailable(void *m) { return g_gyro ? YES : NO; }
 
-static int g_fps = 120;
 static void (*o_setTargetFrameRate)(int, void *);
 static void r_setTargetFrameRate(int v, void *m) {
+    S2LOG("game set targetFrameRate=%d -> %d", v, g_fps);
     if (o_setTargetFrameRate) o_setTargetFrameRate(g_fps, m);
 }
 
-static void r_setFieldOfView(void *cam, float v, void *m) { S2LOG("Camera.fieldOfView <- %.2f", v); }
-static void r_setAspect(void *cam, float v, void *m) { S2LOG("Camera.aspect <- %.4f", v); }
-static void r_setResolution(void *a, void *b, void *c, void *m) { S2LOG("Screen.SetResolution(...)"); }
+static void (*o_setFieldOfView)(void *, float, void *);
+static int g_fovLog;
+static void r_setFieldOfView(void *cam, float v, void *m) {
+    float nv = v * g_fovMult;
+    if (g_fovLog < 8) { S2LOG("Camera.fieldOfView %.2f -> %.2f", v, nv); g_fovLog++; }
+    if (o_setFieldOfView) o_setFieldOfView(cam, nv, m);
+}
 
-static void r_prefsSetFloat(void *k, float v, void *m) { S2LOG("PlayerPrefs.SetFloat(%s) = %.3f", ilsc(k), v); }
-static void r_prefsSetInt(void *k, int v, void *m) { S2LOG("PlayerPrefs.SetInt(%s) = %d", ilsc(k), v); }
-static void r_prefsSetString(void *k, void *v, void *m) { S2LOG("PlayerPrefs.SetString(%s) = %s", ilsc(k), ilsc(v)); }
+static void (*o_setAspect)(void *, float, void *);
+static int g_aspectLog;
+static void r_setAspect(void *cam, float v, void *m) {
+    float nv = (g_aspect > 0.01f) ? g_aspect : v;
+    if (g_aspectLog < 8) { S2LOG("Camera.aspect %.4f -> %.4f", v, nv); g_aspectLog++; }
+    if (o_setAspect) o_setAspect(cam, nv, m);
+}
+
+static void r_prefsSetFloat(void *k, float v, void *m) { S2LOG("Prefs.SetFloat(%s)=%.3f", ilsc(k), v); }
+static void r_prefsSetInt(void *k, int v, void *m)     { S2LOG("Prefs.SetInt(%s)=%d", ilsc(k), v); }
+static void r_prefsSetString(void *k, void *v, void *m){ S2LOG("Prefs.SetString(%s)=%s", ilsc(k), ilsc(v)); }
 
 #pragma mark - 扫描挂钩
 
-typedef struct { const char *name; void *repl; int argc; } hookwant;
+typedef struct { const char *name; void *repl; int argc; int hit; } hookwant;
 
-static const hookwant kWants[] = {
-    { "IsGyroAvailable",       (void *)r_isGyroAvailable,     0 },
-    { "get_supportsGyroscope", (void *)r_supportsGyroscope,   0 },
-    { "get_fieldOfView",       NULL,                           0 }, // 只占位，不挂
+static hookwant kWants[] = {
+    { "IsGyroAvailable",         (void *)r_isGyroAvailable,      0, 0 },
+    { "get_supportsGyroscope",   (void *)r_supportsGyroscope,    0, 0 },
+    { "SupportsGyroscope",       (void *)r_supportsGyroscope,    0, 0 },
 };
 
 static void scan_all(void) {
-    if (!g_domain) return;
+    if (!g_domain || !fn_domain_get_assemblies) return;
     size_t n = 0;
     void **asms = (void **)fn_domain_get_assemblies(g_domain, &n);
-    S2LOG("scan: %zu assemblies", n);
+    S2LOG("scan %zu assemblies", n);
+    size_t totalTypes = 0, totalMethods = 0;
     for (size_t a = 0; a < n; a++) {
         void *img = fn_assembly_get_image(asms[a]);
         if (!img) continue;
-        size_t cc = (size_t)(uintptr_t)fn_image_get_class_count(img);
+        size_t cc = fn_image_get_class_count ? fn_image_get_class_count(img) : 0;
+        totalTypes += cc;
         for (size_t i = 0; i < cc; i++) {
-            void *k = fn_image_get_class(img, i);
+            void *k = fn_image_get_class ? fn_image_get_class(img, i) : NULL;
             if (!k) continue;
-            void *it = NULL;
-            void *m;
+            void *it = NULL; void *m;
             while ((m = fn_class_get_methods(k, &it))) {
+                totalMethods++;
                 const char *mn = fn_method_get_name(m);
                 if (!mn) continue;
                 for (unsigned j = 0; j < sizeof(kWants)/sizeof(kWants[0]); j++) {
-                    if (!kWants[j].repl) continue;
+                    if (!kWants[j].repl || kWants[j].hit) continue;
                     if (strcmp(mn, kWants[j].name) == 0 &&
                         fn_method_get_param_count(m) == kWants[j].argc) {
-                        S2LOG("hook %s.%s::%s (%d args)",
-                              fn_class_get_namespace(k) ? fn_class_get_namespace(k) : "",
-                              fn_class_get_name(k), mn, kWants[j].argc);
+                        S2LOG("HIT %s.%s::%s", fn_class_get_namespace(k) ?: "", fn_class_get_name(k) ?: "", mn);
                         patch_pointer(m, kWants[j].repl);
-                        g_hooked++;
+                        kWants[j].hit = 1; g_hooked++;
                     }
                 }
             }
         }
     }
-    S2LOG("scan done, hooked %d methods", g_hooked);
+    S2LOG("scan done types=%zu methods=%zu hooked=%d", totalTypes, totalMethods, g_hooked);
+    for (unsigned j = 0; j < sizeof(kWants)/sizeof(kWants[0]); j++)
+        if (!kWants[j].hit) S2LOG("MISS %s", kWants[j].name);
 }
 
-static void *hook_named(const char *ns, const char *cls, const char *name, int argc, void *repl, const char *asmName) {
-    if (!g_domain) return NULL;
+static void *hook_named(const char *cls, const char *name, int argc, void *repl, const char *asmName, const char *ns) {
+    if (!g_domain || !fn_domain_assembly_open) return NULL;
     void *as = fn_domain_assembly_open(g_domain, asmName);
     if (!as) { S2LOG("assembly %s missing", asmName); return NULL; }
     void *img = fn_assembly_get_image(as);
@@ -171,37 +228,30 @@ static void *hook_named(const char *ns, const char *cls, const char *name, int a
     if (!m) { S2LOG("method %s::%s/%d NOT found", cls, name, argc); return NULL; }
     void *old = *(void **)m;
     patch_pointer(m, repl);
-    S2LOG("hook %s.%s::%s (old=%p)", ns, cls, name, old);
+    S2LOG("hooked %s::%s (old=%p)", cls, name, old);
     return old;
 }
 
 #pragma mark - install
 
 static void install(void) {
-    S2LOG("=== install v2 ===");
-    S2LOG("device=%s sys=%s", [[[UIDevice currentDevice] model] UTF8String], [[[UIDevice currentDevice] systemVersion] UTF8String]);
+    S2LOG("=== install v3 ===");
+    const char *u = "UnityEngine.CoreModule";
+    o_setTargetFrameRate = (void (*)(int, void *))hook_named("Application", "set_targetFrameRate", 1, (void *)r_setTargetFrameRate, u, "UnityEngine");
+    o_setFieldOfView     = (void (*)(void *, float, void *))hook_named("Camera", "set_fieldOfView", 1, (void *)r_setFieldOfView, u, "UnityEngine");
+    o_setAspect          = (void (*)(void *, float, void *))hook_named("Camera", "set_aspect", 1, (void *)r_setAspect, u, "UnityEngine");
+    hook_named("PlayerPrefs", "SetFloat", 2, (void *)r_prefsSetFloat, u, "UnityEngine");
+    hook_named("PlayerPrefs", "SetInt", 2, (void *)r_prefsSetInt, u, "UnityEngine");
+    hook_named("PlayerPrefs", "SetString", 2, (void *)r_prefsSetString, u, "UnityEngine");
     scan_all();
-
-    const char *unity = "UnityEngine.CoreModule";
-    o_setTargetFrameRate = (void (*)(int, void *))hook_named("UnityEngine", "Application", "set_targetFrameRate", 1, (void *)r_setTargetFrameRate, unity);
-    hook_named("UnityEngine", "Camera",      "set_fieldOfView", 1, (void *)r_setFieldOfView, unity);
-    hook_named("UnityEngine", "Camera",      "set_aspect",      1, (void *)r_setAspect,      unity);
-    hook_named("UnityEngine", "Screen",      "SetResolution",   3, (void *)r_setResolution,  unity);
-    hook_named("UnityEngine", "PlayerPrefs", "SetFloat",        2, (void *)r_prefsSetFloat,  unity);
-    hook_named("UnityEngine", "PlayerPrefs", "SetInt",          2, (void *)r_prefsSetInt,    unity);
-    hook_named("UnityEngine", "PlayerPrefs", "SetString",       2, (void *)r_prefsSetString, unity);
-
-    if (o_setTargetFrameRate) {
-        S2LOG("forcing targetFrameRate=%d now", g_fps);
-        o_setTargetFrameRate(g_fps, NULL);
-    }
+    if (o_setTargetFrameRate) o_setTargetFrameRate(g_fps, NULL);
     S2LOG("=== install done ===");
 }
 
 static void bootstrap(void) {
     resolve_il2cpp();
-    for (int i = 0; i < 60 && !fn_domain_get; i++) { usleep(200 * 1000); resolve_il2cpp(); }
-    S2LOG("il2cpp domain_get=%p asm_open=%p class_from_name=%p", fn_domain_get, fn_domain_assembly_open, fn_class_from_name);
+    for (int i = 0; i < 75 && !fn_domain_get; i++) { usleep(200 * 1000); resolve_il2cpp(); }
+    S2LOG("il2cpp domain_get=%p class_from_name=%p", fn_domain_get, fn_class_from_name);
     for (int i = 0; i < 150; i++) {
         g_domain = fn_domain_get ? fn_domain_get() : NULL;
         if (g_domain) break;
@@ -216,9 +266,27 @@ static void bootstrap(void) {
 
 __attribute__((constructor))
 static void s2fix_init(void) {
-    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    g_logPath = [docs stringByAppendingPathComponent:@"s2fix.log"];
+    g_docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    g_logPath = [g_docs stringByAppendingPathComponent:@"s2fix.log"];
+    g_cfgPath = [g_docs stringByAppendingPathComponent:@"s2fix.txt"];
     [[NSFileManager defaultManager] createFileAtPath:g_logPath contents:[NSData data] attributes:nil];
-    S2LOG("loaded pid=%d uid=%d log=%s", getpid(), getuid(), [g_logPath UTF8String]);
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ bootstrap(); });
+    load_config();
+    S2LOG("loaded pid=%d uid=%d", getpid(), getuid());
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        bootstrap();
+        // 加载证明：每次装包第一次启动弹一次
+        NSString *flag = [g_docs stringByAppendingPathComponent:@"s2fix.shown"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:flag]) {
+            [[NSData data] writeToFile:flag atomically:YES];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"S2Fix v3 已加载"
+                    message:[NSString stringWithFormat:@"fov=%.2f hands=%.2f aspect=%.2f fps=%d\n日志: 文件App/StandChillow/s2fix.log", g_fovMult, g_handsMult, g_aspect, g_fps]
+                    preferredStyle:UIAlertControllerStyleAlert];
+                [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+                UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
+                if (vc) [vc presentViewController:ac animated:YES completion:nil];
+            });
+        }
+    });
 }
