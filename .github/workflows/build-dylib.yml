@@ -1,6 +1,5 @@
 name: build-dylib
 
-# 只编 dylib，不需要原版 IPA —— 立刻能出产物
 on:
   workflow_dispatch:
   push:
@@ -10,72 +9,69 @@ on:
 
 jobs:
   dylib:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
-      - name: Toolchain
+      - name: Deps
         run: |
-          xcrun --sdk iphoneos --show-sdk-path
-          xcrun -sdk iphoneos clang --version | head -2
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm libplist-dev libssl-dev make git unzip curl zip
+          clang --version | head -2
+          ld.lld --version | head -1
+          apt-get install -y -qq ldid || echo "no ldid pkg"
 
-      - name: Build arm64 dylib
+      - name: Fetch iPhoneOS SDK
         run: |
-          set -euo pipefail
+          set -eux
+          cd $RUNNER_TEMP
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdks
+          cd sdks && git sparse-checkout set iPhoneOS15.6.sdk
+          du -sh iPhoneOS15.6.sdk
+          echo "SDK=$RUNNER_TEMP/sdks/iPhoneOS15.6.sdk" >> $GITHUB_ENV
+
+      - name: Build ldid if missing
+        run: |
+          set -eux
+          if command -v ldid; then ldid -v || true; exit 0; fi
+          cd $RUNNER_TEMP
+          git clone --depth=1 https://github.com/ProcursusTeam/ldid.git
+          cd ldid && cp /usr/include/plist/plist.h . 2>/dev/null || true
+          make -j4
+          sudo cp ldid /usr/local/bin/
+
+      - name: Build dylib
+        run: |
+          set -eux
           mkdir -p build
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
-            -isysroot "$SDK" -framework Foundation -fobjc-arc -O2 \
-            -miphoneos-version-min=12.0 \
+          clang -target arm64-apple-ios12.0 -dynamiclib \
+            -isysroot "$SDK" -fuse-ld=lld \
+            -framework Foundation -fobjc-arc -O2 \
             -install_name @executable_path/Frameworks/OfflineOnly.dylib \
             -o build/OfflineOnly.dylib tweak/OfflineOnly.m
-          lipo -info build/OfflineOnly.dylib
-          codesign --force --sign - build/OfflineOnly.dylib
-          codesign -dv build/OfflineOnly.dylib 2>&1 | head -4
+          file build/OfflineOnly.dylib || true
           ls -lh build/
+          ldid -S build/OfflineOnly.dylib && echo "ldid signed"
 
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
+      - name: Verify Mach-O
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import struct
+          b=open('build/OfflineOnly.dylib','rb').read(64)
+          magic,=struct.unpack_from('<I',b,0)
+          cpu,sub,ft,=struct.unpack_from('<iiI',b,4)
+          print('magic %#x cputype %#x subtype %#x filetype %d'%(magic,cpu,sub,ft))
+          assert magic in (0xfeedfacf,0xfeedface), 'not mach-o'
+          assert cpu==0x0100000c or cpu==12, 'not arm64'
+          assert ft==6, 'not dylib'
+          print('OK arm64 dylib')
+          PY
+
+      - uses: actions/upload-artifact@v4
         with:
           name: OfflineOnly-dylib
           path: build/OfflineOnly.dylib
           if-no-files-found: error
-
-  # 有 ipa_url 输入时才跑完整打包
-  ipa:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.ipa_url != '' }}
-    runs-on: macos-14
-    needs: dylib
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: OfflineOnly-dylib
-          path: build
-      - name: Fetch IPA
-        run: |
-          mkdir -p work && cd work
-          curl -L --retry 3 -o orig.ipa "${{ inputs.ipa_url }}"
-          ls -lh orig.ipa
-      - name: Inject + sign + repack
-        run: |
-          set -euo pipefail
-          cd work
-          unzip -q orig.ipa -d app
-          APP=app/Payload/StandChillow.app
-          cp ../build/OfflineOnly.dylib "$APP/Frameworks/"
-          chmod 755 "$APP/Frameworks/OfflineOnly.dylib"
-          python3 ../tools/macho_inject.py "$APP/StandChillow" "@executable_path/Frameworks/OfflineOnly.dylib"
-          codesign --force --sign - "$APP/Frameworks/OfflineOnly.dylib"
-          codesign --force --deep --sign - "$APP"
-          zip -qry -1 ../Standoff2-Offline-unsigned.ipa Payload
-          cd .. && shasum -a 256 Standoff2-Offline-unsigned.ipa | tee sha256.txt
-          split -b 1800m Standoff2-Offline-unsigned.ipa part_
-      - uses: actions/upload-artifact@v4
-        with:
-          name: offline-ipa-parts
-          path: |
-            part_*
-            sha256.txt
-          compression-level: 0
