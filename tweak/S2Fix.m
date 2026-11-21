@@ -95,6 +95,39 @@ static BOOL patch(void *mi, void *repl, const char *tag) {
     return YES;
 }
 
+
+// ---- 机器码级 hook：IL2CPP 对非虚方法编译成直接调用，改 MethodInfo->methodPointer 对
+// 直接调用无效（那只是给反射/委托用的）。所以真正的修法是把函数体开头几条指令改掉。
+static void dump_code(void *fn, const char *tag) {
+    if (!fn) { L("code %s: null", tag); return; }
+    uint32_t *w = (uint32_t *)fn;
+    L("code %s @%p: %08x %08x %08x %08x", tag, fn, w[0], w[1], w[2], w[3]);
+}
+
+static BOOL wr_code(void *fn, const void *bytes, size_t n, const char *tag) {
+    if (!fn) return NO;
+    uintptr_t a = (uintptr_t)fn, page = a & ~(uintptr_t)0xFFF;
+    size_t len = (a + n) - page;
+    kern_return_t kr = vm_protect(mach_task_self(), page, len, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) { L("wr %s: vm_protect rc=%d", tag, kr); return NO; }
+    memcpy((void *)a, bytes, n);
+    __builtin___clear_cache((char *)a, (char *)(a + n));
+    L("wr %s @%p ok", tag, fn);
+    return YES;
+}
+
+// mov w0,#1 ; ret   → 恒返回 true
+static BOOL hook_true(void *fn, const char *tag) {
+    static const uint32_t ins[2] = {0x52800020u, 0xD65F03C0u};
+    return wr_code(fn, ins, 8, tag);
+}
+// ret → 什么都不做
+static BOOL hook_nop(void *fn, const char *tag) {
+    static const uint32_t ins[1] = {0xD65F03C0u};
+    return wr_code(fn, ins, 4, tag);
+}
+
 static void *cls_in(const char *asmName, const char *ns, const char *cls, void *domain) {
     if (!p_domain_assembly_open || !p_class_from_name || !p_assembly_get_image) return NULL;
     void *as = ((void *(*)(void *, const char *))p_domain_assembly_open)(domain, asmName);
@@ -162,15 +195,20 @@ static void bootstrap_body(void *domain) {
 
     if (g_stage >= 3) {
         void *m = mth(kapp, "set_targetFrameRate", 1);
-        if (m) { o_tfr = (void (*)(int, void *))*(void **)m; patch(m, (void *)h_tfr, "targetFrameRate"); }
-        else L("set_targetFrameRate not found");
+        if (m) {
+            void *code = *(void **)m;
+            dump_code(code, "set_targetFrameRate");
+            o_tfr = (void (*)(int, void *))code;
+            patch(m, (void *)h_tfr, "targetFrameRate(mi)");
+            hook_nop(code, "set_targetFrameRate");
+        } else L("set_targetFrameRate not found");
     }
     if (g_stage >= 4) {
         void *f = mth(kcam, "set_fieldOfView", 1);
         void *a = mth(kcam, "set_aspect", 1);
         L("fov=%p aspect=%p", f, a);
-        if (f) { o_fov = (void (*)(void *, float, void *))*(void **)f; patch(f, (void *)h_fov, "fieldOfView"); }
-        if (a) { o_asp = (void (*)(void *, float, void *))*(void **)a; patch(a, (void *)h_asp, "aspect"); }
+        if (f) { dump_code(*(void **)f, "set_fieldOfView"); o_fov = (void (*)(void *, float, void *))*(void **)f; patch(f, (void *)h_fov, "fieldOfView(mi)"); }
+        if (a) { dump_code(*(void **)a, "set_aspect");    o_asp = (void (*)(void *, float, void *))*(void **)a; patch(a, (void *)h_asp, "aspect(mi)"); }
     }
     if (g_stage >= 5) {
         // 按名扫描陀螺仪能力方法
@@ -194,13 +232,26 @@ static void bootstrap_body(void *domain) {
                         L("gyro hook %s.%s::%s",
                           p_class_get_namespace ? ((const char *(*)(void *))p_class_get_namespace)(k) : "?",
                           p_class_get_name ? ((const char *(*)(void *))p_class_get_name)(k) : "?", mn);
-                        patch(m, (void *)h_gyro, mn);
+                        void *code = *(void **)m;      // 原始函数体地址（必须在改 methodPointer 之前取）
+                        dump_code(code, mn);
+                        patch(m, (void *)h_gyro, mn);   // 反射/委托路径
+                        hook_true(code, mn);            // 直接调用路径：函数体改成 mov w0,#1; ret
                         hits++;
                     }
                 }
             }
         }
         L("gyro hooks installed=%d", hits);
+
+        // 诊断：设备型号这条链。很多游戏用型号白名单判断陀螺仪，新机型不在表里就标"此设备上不可用"
+        void *kinfo = cls_in("UnityEngine.CoreModule", "UnityEngine", "SystemInfo", domain);
+        if (kinfo) {
+            void *gm = mth(kinfo, "GetDeviceModel", 0);
+            void *gt = mth(kinfo, "get_deviceModel", 0);
+            L("SystemInfo: GetDeviceModel=%p", gm);
+            if (gm) dump_code(*(void **)gm, "GetDeviceModel");
+            if (gt && gt != gm) dump_code(*(void **)gt, "get_deviceModel");
+        } else L("SystemInfo class missing");
     }
     L("=== v6 install done ===");
 }
