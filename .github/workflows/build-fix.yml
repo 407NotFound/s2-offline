@@ -1,0 +1,46 @@
+name: build-fix
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tweak/S2Fix.m'
+      - '.github/workflows/build-fix.yml'
+jobs:
+  dylib:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm make git zip curl
+      - name: SDK
+        run: |
+          set -eux
+          cd $RUNNER_TEMP
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdks
+          cd sdks && git sparse-checkout set iPhoneOS15.6.sdk
+          echo "SDK=$RUNNER_TEMP/sdks/iPhoneOS15.6.sdk" >> $GITHUB_ENV
+      - name: Build S2Fix.dylib
+        run: |
+          set -eux
+          mkdir -p dist
+          clang -target arm64-apple-ios15.0 -dynamiclib -isysroot "$SDK" -fuse-ld=lld \
+            -framework Foundation -framework UIKit -fobjc-arc -O2 -fblocks \
+            -install_name @executable_path/Frameworks/S2Fix.dylib \
+            -o dist/S2Fix.dylib tweak/S2Fix.m
+          ls -lh dist/S2Fix.dylib
+          python3 - <<'PY'
+          import struct
+          b=open('dist/S2Fix.dylib','rb').read()
+          magic,cpu,sub,ft=struct.unpack_from('<IiiI',b,0)
+          print('magic %#x cpu %#x ft %d size %d'%(magic,cpu,ft,len(b)))
+          assert magic==0xfeedfacf and cpu==0x0100000c and ft==6
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: S2Fix-dylib
+          path: dist/S2Fix.dylib
+          if-no-files-found: error
