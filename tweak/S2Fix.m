@@ -59,11 +59,11 @@ static void load_config(void) {
     if (![fm fileExistsAtPath:g_cfgPath]) {
         NSString *def = @"# S2Fix 配置，改完重启游戏生效\n"
                         @"# fov: 视野系数, 1.00 = 原样, 1.10 = 放大 10%\n"
-                        @"fov=1.00\n"
+                        @"fov=1.10\n"
                         @"# hands_fov: 手部视野系数\n"
-                        @"hands_fov=1.00\n"
+                        @"hands_fov=1.10\n"
                         @"# aspect: 0=不干预, 1.25=5:4, 1.3333=4:3, 1.6=16:10\n"
-                        @"aspect=0\n"
+                        @"aspect=1.25\n"
                         @"# fps: 目标帧率\n"
                         @"fps=120\n"
                         @"# gyro: 1=强制可用\n"
@@ -151,10 +151,12 @@ static void r_setTargetFrameRate(int v, void *m) {
 }
 
 static void (*o_setFieldOfView)(void *, float, void *);
+static void *(*g_getCameraName)(void *, void *);
+static const char *cname(void *cam) { if (!g_getCameraName) return "?"; return ilsc(g_getCameraName(cam, NULL)); }
 static int g_fovLog;
 static void r_setFieldOfView(void *cam, float v, void *m) {
     float nv = v * g_fovMult;
-    if (g_fovLog < 8) { S2LOG("Camera.fieldOfView %.2f -> %.2f", v, nv); g_fovLog++; }
+    if (g_fovLog < 14) { S2LOG("Camera[%s].fieldOfView %.2f -> %.2f", cname(cam), v, nv); g_fovLog++; }
     if (o_setFieldOfView) o_setFieldOfView(cam, nv, m);
 }
 
@@ -239,6 +241,13 @@ static void install(void) {
     const char *u = "UnityEngine.CoreModule";
     o_setTargetFrameRate = (void (*)(int, void *))hook_named("Application", "set_targetFrameRate", 1, (void *)r_setTargetFrameRate, u, "UnityEngine");
     o_setFieldOfView     = (void (*)(void *, float, void *))hook_named("Camera", "set_fieldOfView", 1, (void *)r_setFieldOfView, u, "UnityEngine");
+    if (g_domain) {
+        void *as = fn_domain_assembly_open(g_domain, u);
+        void *img = as ? fn_assembly_get_image(as) : NULL;
+        void *kc = img ? fn_class_from_name(img, "UnityEngine", "Camera") : NULL;
+        void *gm = kc ? fn_class_get_method_from_name(kc, "get_name", 0) : NULL;
+        if (gm) { g_getCameraName = (void *(*)(void *, void *))*(void **)gm; S2LOG("camera name getter=%p", g_getCameraName); }
+    }
     o_setAspect          = (void (*)(void *, float, void *))hook_named("Camera", "set_aspect", 1, (void *)r_setAspect, u, "UnityEngine");
     hook_named("PlayerPrefs", "SetFloat", 2, (void *)r_prefsSetFloat, u, "UnityEngine");
     hook_named("PlayerPrefs", "SetInt", 2, (void *)r_prefsSetInt, u, "UnityEngine");
