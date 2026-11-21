@@ -13,6 +13,7 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <sys/mman.h>
+#import <libkern/OSCacheControl.h>
 #import <unistd.h>
 
 static NSString *g_log;
@@ -112,7 +113,7 @@ static BOOL wr_code(void *fn, const void *bytes, size_t n, const char *tag) {
                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) { L("wr %s: vm_protect rc=%d", tag, kr); return NO; }
     memcpy((void *)a, bytes, n);
-    __builtin___clear_cache((char *)a, (char *)(a + n));
+    sys_icache_invalidate((void *)a, n);
     L("wr %s @%p ok", tag, fn);
     return YES;
 }
