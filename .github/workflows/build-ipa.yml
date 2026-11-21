@@ -3,8 +3,8 @@ name: build-ipa
 on:
   workflow_dispatch:
     inputs:
-      ipa_url:
-        description: "原版 2.07 IPA 的直链（R2/S3 presigned 或 release asset）"
+      ipa_urls:
+        description: "原版 IPA 直链，多个用逗号分隔（切分片时按顺序拼回去）"
         required: true
 
 jobs:
@@ -24,10 +24,23 @@ jobs:
           }
 
       - name: Fetch IPA
+        env:
+          URLS: ${{ inputs.ipa_urls }}
         run: |
           set -eux
           mkdir -p work && cd work
-          curl -L --retry 3 --retry-delay 5 -o orig.ipa "${{ inputs.ipa_url }}"
+          i=0
+          echo "$URLS" | tr ',' '\n' | while read -r u; do
+            [ -z "$u" ] && continue
+            i=$((i+1))
+            curl -L --retry 3 --retry-delay 5 -o "part_$i" "$u"
+            ls -lh "part_$i"
+          done
+          if ls part_2 >/dev/null 2>&1; then
+            cat $(ls part_* | sort -V) > orig.ipa
+          else
+            mv part_1 orig.ipa
+          fi
           ls -lh orig.ipa
           python3 -c "import hashlib;print('sha256',hashlib.sha256(open('orig.ipa','rb').read()).hexdigest())"
 
