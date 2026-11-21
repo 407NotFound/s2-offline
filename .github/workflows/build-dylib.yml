@@ -1,0 +1,81 @@
+name: build-dylib
+
+# 只编 dylib，不需要原版 IPA —— 立刻能出产物
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tweak/**'
+      - '.github/workflows/build-dylib.yml'
+
+jobs:
+  dylib:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun -sdk iphoneos clang --version | head -2
+
+      - name: Build arm64 dylib
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -isysroot "$SDK" -framework Foundation -fobjc-arc -O2 \
+            -miphoneos-version-min=12.0 \
+            -install_name @executable_path/Frameworks/OfflineOnly.dylib \
+            -o build/OfflineOnly.dylib tweak/OfflineOnly.m
+          lipo -info build/OfflineOnly.dylib
+          codesign --force --sign - build/OfflineOnly.dylib
+          codesign -dv build/OfflineOnly.dylib 2>&1 | head -4
+          ls -lh build/
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: OfflineOnly-dylib
+          path: build/OfflineOnly.dylib
+          if-no-files-found: error
+
+  # 有 ipa_url 输入时才跑完整打包
+  ipa:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.ipa_url != '' }}
+    runs-on: macos-14
+    needs: dylib
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: OfflineOnly-dylib
+          path: build
+      - name: Fetch IPA
+        run: |
+          mkdir -p work && cd work
+          curl -L --retry 3 -o orig.ipa "${{ inputs.ipa_url }}"
+          ls -lh orig.ipa
+      - name: Inject + sign + repack
+        run: |
+          set -euo pipefail
+          cd work
+          unzip -q orig.ipa -d app
+          APP=app/Payload/StandChillow.app
+          cp ../build/OfflineOnly.dylib "$APP/Frameworks/"
+          chmod 755 "$APP/Frameworks/OfflineOnly.dylib"
+          python3 ../tools/macho_inject.py "$APP/StandChillow" "@executable_path/Frameworks/OfflineOnly.dylib"
+          codesign --force --sign - "$APP/Frameworks/OfflineOnly.dylib"
+          codesign --force --deep --sign - "$APP"
+          zip -qry -1 ../Standoff2-Offline-unsigned.ipa Payload
+          cd .. && shasum -a 256 Standoff2-Offline-unsigned.ipa | tee sha256.txt
+          split -b 1800m Standoff2-Offline-unsigned.ipa part_
+      - uses: actions/upload-artifact@v4
+        with:
+          name: offline-ipa-parts
+          path: |
+            part_*
+            sha256.txt
+          compression-level: 0

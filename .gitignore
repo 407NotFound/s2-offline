@@ -1,0 +1,9 @@
+bin/
+res/
+build/
+out/
+*.ipa
+part_*
+tweak/.theos/
+meta/global-metadata.dat
+__pycache__/
