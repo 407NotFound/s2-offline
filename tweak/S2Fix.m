@@ -20,6 +20,11 @@ static int g_stage = 5;
 static float g_fov = 1.10f, g_hands = 1.10f, g_aspect = 1.25f;
 static int g_fps = 120, g_gyro = 1;
 static void *g_uf;
+static int g_attempt = 0;
+
+static void try_init(void);
+static void bootstrap_body(void *domain);
+static void resolve(void);
 
 static void L(const char *fmt, ...) {
     char buf[900];
@@ -121,19 +126,36 @@ static void h_asp(void *cam, float v, void *m) {
 
 static BOOL h_gyro(void *m) { return g_gyro ? YES : NO; }
 
-static void bootstrap(void) {
-    L("=== v6 boot stage=%d ===", g_stage);
-    for (int i = 0; i < 60 && !p_domain_get; i++) { open_unity(); resolve(); if (!p_domain_get) usleep(200*1000); }
-    L("symbols: domain_get=%p asm_open=%p class_from_name=%p get_class=%p gyroFn?", p_domain_get, p_domain_assembly_open, p_class_from_name, p_image_get_class);
-    if (g_stage < 2) { L("stage1 done"); return; }
-    if (!p_domain_get) { L("ABORT: still no il2cpp symbols"); return; }
-
-    void *domain = NULL;
-    for (int i = 0; i < 100 && !domain; i++) { domain = ((void *(*)(void))p_domain_get)(); if (!domain) usleep(150*1000); }
+static void try_init(void) {
+    g_attempt++;
+    if (g_attempt > 30) { L("give up after %d attempts", g_attempt); return; }
+    Class uac = NSClassFromString(@"UnityAppController");
+    BOOL window = [UIApplication sharedApplication].keyWindow != nil || [UIApplication sharedApplication].windows.count > 0;
+    L("attempt %d: UnityAppController=%d window=%d", g_attempt, uac != nil, window);
+    if (!uac || !window) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ try_init(); });
+        return;
+    }
+    if (g_stage < 1) return;
+    open_unity();
+    resolve();
+    L("symbols: domain_get=%p asm_open=%p class_from_name=%p", p_domain_get, p_domain_assembly_open, p_class_from_name);
+    if (!p_domain_get) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ try_init(); });
+        return;
+    }
+    void *domain = ((void *(*)(void))p_domain_get)();
     L("domain=%p", domain);
-    if (!domain) return;
-    if (p_thread_attach) ((void *(*)(void *))p_thread_attach)(domain);
+    if (!domain) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ try_init(); });
+        return;
+    }
+    bootstrap_body(domain);
+}
 
+static void bootstrap_body(void *domain) {
+    L("=== body start stage=%d ===", g_stage);
+    if (g_stage < 2) { L("stage1 done"); return; }
     void *kcam = cls_in("UnityEngine.CoreModule", "UnityEngine", "Camera", domain);
     void *kapp = cls_in("UnityEngine.CoreModule", "UnityEngine", "Application", domain);
     L("classes: Application=%p Camera=%p", kapp, kcam);
@@ -183,8 +205,9 @@ static void bootstrap(void) {
     L("=== v6 install done ===");
 }
 
+
 __attribute__((constructor))
-static void init6(void) {
+static void init7(void) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     g_log = [docs stringByAppendingPathComponent:@"s2fix.log"];
     [[NSFileManager defaultManager] createFileAtPath:g_log contents:[NSData data] attributes:nil];
@@ -206,6 +229,9 @@ static void init6(void) {
         else if ([k isEqualToString:@"fps"]) g_fps = v.intValue;
         else if ([k isEqualToString:@"gyro"]) g_gyro = v.intValue;
     }
-    L("loaded pid=%d stage=%d fov=%.2f aspect=%.2f", getpid(), g_stage, g_fov, g_aspect);
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ bootstrap(); });
+    L("loaded pid=%d stage=%d fov=%.2f aspect=%.2f (v7: 主线程延迟初始化)", getpid(), g_stage, g_fov, g_aspect);
+    // 关键：绝不在这里碰 il2cpp，也不开线程；等 UIKit/Unity 都起来，回主线程再动
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        try_init();
+    });
 }
