@@ -1,0 +1,25 @@
+name: build-probe
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang lld
+      - name: sdk
+        run: |
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git sdks
+          cd sdks && git sparse-checkout set iPhoneOS15.6.sdk
+      - name: build
+        run: |
+          mkdir -p dist
+          clang -target arm64-apple-ios15.0 -dynamiclib -isysroot "$PWD/sdks/iPhoneOS15.6.sdk" \
+            -fuse-ld=lld -fobjc-arc -O2 -framework Foundation -framework UIKit \
+            -install_name @executable_path/Frameworks/S2Probe.dylib \
+            -o dist/S2Probe.dylib tweak/S2Probe.m
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: S2Probe
+          path: dist/S2Probe.dylib
